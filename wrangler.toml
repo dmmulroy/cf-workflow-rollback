@@ -1,0 +1,12 @@
+name = "cf-workflow-rollback-test"
+main = "tests/helpers/test-workflow.ts"
+compatibility_date = "2024-12-01"
+
+[[kv_namespaces]]
+binding = "CALL_LOG"
+id = "test-call-log"
+
+[[workflows]]
+name = "test-workflow"
+binding = "TEST_WORKFLOW"
+class_name = "TestWorkflow"

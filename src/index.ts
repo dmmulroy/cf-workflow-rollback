@@ -1,4 +1,8 @@
-import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
+import {
+	NonRetryableError,
+	type WorkflowStep,
+	type WorkflowStepConfig,
+} from "cloudflare:workers";
 
 type Serializable<T> = Rpc.Serializable<T>;
 
@@ -14,6 +18,14 @@ export type RollbackHandler<T> = Readonly<{
 }>;
 
 /**
+ * Extended config for doWithRollback that includes undo step configuration.
+ */
+export type RollbackStepConfig = WorkflowStepConfig & {
+	/** Config for the undo step. "inherit" (default) uses the run step's config. */
+	undo?: "inherit" | WorkflowStepConfig;
+};
+
+/**
  * The return type of withRollback
  */
 export type RollbackContext = {
@@ -23,7 +35,7 @@ export type RollbackContext = {
 	doWithRollback: <T extends Serializable<T>>(
 		name: string,
 		handler: RollbackHandler<T>,
-		config?: WorkflowStepConfig,
+		config?: RollbackStepConfig,
 	) => Promise<T>;
 	/** Execute all registered undo handlers in LIFO order */
 	rollbackAll: (error: unknown) => Promise<void>;
@@ -59,7 +71,10 @@ export type RollbackContext = {
  * ```
  */
 export function withRollback(workflowStep: WorkflowStep): RollbackContext {
-	const undoStack: ((error: unknown) => Promise<void>)[] = [];
+	const undoStack: {
+		name: string;
+		execute: (error: unknown) => Promise<void>;
+	}[] = [];
 
 	/**
 	 * Execute a step with a rollback handler.
@@ -68,15 +83,23 @@ export function withRollback(workflowStep: WorkflowStep): RollbackContext {
 	async function doWithRollback<T extends Serializable<T>>(
 		name: string,
 		handler: RollbackHandler<T>,
-		config: WorkflowStepConfig = {},
+		config: RollbackStepConfig = {},
 	): Promise<T> {
-		const result = (await workflowStep.do(name, config, handler.run)) as T;
+		const { undo: undoConfigOption, ...runConfig } = config;
+		const result = (await workflowStep.do(name, runConfig, handler.run)) as T;
 
-		undoStack.push((error: unknown) =>
-			workflowStep.do(`Undo '${name}'`, async () =>
-				handler.undo(error, result),
-			),
-		);
+		const undoConfig =
+			undoConfigOption === undefined || undoConfigOption === "inherit"
+				? runConfig
+				: undoConfigOption;
+
+		undoStack.push({
+			name,
+			execute: (error: unknown) =>
+				workflowStep.do(`Undo '${name}'`, undoConfig, async () =>
+					handler.undo(error, result),
+				),
+		});
 
 		return result;
 	}
@@ -84,17 +107,28 @@ export function withRollback(workflowStep: WorkflowStep): RollbackContext {
 	/**
 	 * Execute all registered undo handlers in LIFO order.
 	 * Call this in your catch block to rollback completed steps.
+	 * @throws {NonRetryableError} If an undo handler fails after exhausting retries
 	 */
 	async function rollbackAll(error: unknown): Promise<void> {
 		while (undoStack.length > 0) {
 			const undo = undoStack.pop();
-			await undo?.(error);
+			if (!undo) continue;
+
+			try {
+				await undo.execute(error);
+			} catch (undoError) {
+				throw new NonRetryableError(
+					`Undo failed for step '${undo.name}': ${undoError instanceof Error ? undoError.message : String(undoError)}`,
+					{ cause: { originalError: error, undoError, stepName: undo.name } },
+				);
+			}
 		}
 	}
 
 	return {
-		/** The original step.do method */
-		do: workflowStep.do.bind(workflowStep),
+		/** The original step.do method (wrapped to avoid RPC bind issues) */
+		do: ((name, configOrFn, fn?) =>
+			workflowStep.do(name, configOrFn, fn)) as WorkflowStep["do"],
 		/** Execute a step with a rollback handler */
 		doWithRollback: doWithRollback,
 		/** Execute all registered undo handlers in LIFO order */
