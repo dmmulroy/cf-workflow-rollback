@@ -2,7 +2,7 @@ import {
 	NonRetryableError,
 	type WorkflowStep,
 	type WorkflowStepConfig,
-} from "cloudflare:workers";
+} from "cloudflare:workflows";
 
 type Serializable<T> = Rpc.Serializable<T>;
 
