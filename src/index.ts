@@ -1,7 +1,26 @@
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 
-type Serializable<T> = Rpc.Serializable<T>;
+// Custom Serializable that filters out symbol keys (upstream Rpc.Serializable maps them to never, breaking types)
+type Serializable<T> = T extends
+  | undefined
+  | null
+  | boolean
+  | number
+  | bigint
+  | string
+  | ReadableStream
+  | Blob
+  ? T
+  : T extends Array<infer U>
+    ? Array<Serializable<U>>
+    : T extends Map<infer K, infer V>
+      ? Map<Serializable<K>, Serializable<V>>
+      : T extends Set<infer V>
+        ? Set<Serializable<V>>
+        : T extends object
+          ? { [K in keyof T as K extends string | number ? K : never]: Serializable<T[K]> }
+          : never;
 
 /**
  * Handler for a step that can be undone.
@@ -83,12 +102,12 @@ export function withRollback(workflowStep: WorkflowStep): RollbackContext {
     config: RollbackStepConfig = {},
   ): Promise<Serializable<T>> {
     const { undo: undoConfigOption, ...runConfig } = config;
-    // Cast needed: CF types expect Serializable<T> callback but we accept T for ergonomics (matches step.do behavior)
-    const result = await workflowStep.do(
+    // Cast: CF types use Rpc.Serializable which chokes on symbols; we use our own that strips them
+    const result = (await workflowStep.do(
       name,
       runConfig,
-      handler.run as () => Promise<Serializable<T>>,
-    );
+      handler.run as () => Promise<Rpc.Serializable<T>>,
+    )) as Serializable<T>;
 
     const undoConfig =
       undoConfigOption === undefined || undoConfigOption === "inherit"
@@ -135,16 +154,17 @@ export function withRollback(workflowStep: WorkflowStep): RollbackContext {
       configOrFn: WorkflowStepConfig | (() => Promise<T>),
       fn?: () => Promise<T>,
     ): Promise<Serializable<T>> =>
-      fn
+      (fn
         ? workflowStep.do(
-          name,
-          configOrFn as WorkflowStepConfig,
-          fn as () => Promise<Serializable<T>>,
-        )
+            name,
+            configOrFn as WorkflowStepConfig,
+            fn as () => Promise<Rpc.Serializable<T>>,
+          )
         : workflowStep.do(
-          name,
-          configOrFn as () => Promise<Serializable<T>>,
-        )) as WorkflowStep["do"],
+            name,
+            configOrFn as () => Promise<Rpc.Serializable<T>>,
+          )
+      ) as Promise<Serializable<T>>) as WorkflowStep["do"],
     /** Execute a step with a rollback handler */
     doWithRollback: doWithRollback,
     /** Execute all registered undo handlers in LIFO order */
